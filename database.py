@@ -1,6 +1,9 @@
 import sqlite3
 from datetime import datetime
 import config
+import logging
+
+logger = logging.getLogger(__name__)
 
 def get_db_connection():
     conn = sqlite3.connect(config.DATABASE)
@@ -10,6 +13,8 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    
+    # Таблица акций (с колонкой image_url)
     cur.execute('''
         CREATE TABLE IF NOT EXISTS promotions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,10 +34,20 @@ def init_db():
             is_free BOOLEAN DEFAULT 0,
             notified BOOLEAN DEFAULT 0,
             published BOOLEAN DEFAULT 0,
+            image_url TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(store, app_id, end_date)
         )
     ''')
+    
+    # Добавляем колонку image_url, если её нет
+    try:
+        cur.execute('ALTER TABLE promotions ADD COLUMN image_url TEXT')
+        logger.info("✅ Колонка image_url добавлена в promotions")
+    except sqlite3.OperationalError:
+        pass  # колонка уже существует
+    
+    # Таблица черновиков
     cur.execute('''
         CREATE TABLE IF NOT EXISTS drafts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +60,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
     conn.commit()
     conn.close()
 
@@ -59,14 +75,17 @@ def save_promotion(promo_data):
     if existing:
         conn.close()
         return existing['id']
+    
     cur.execute('''
         INSERT INTO promotions (
             store, app_id, title, description, discount_percent,
             old_price, new_price, currency, start_date, end_date,
-            region_restricted, region_alternative, url, is_free, notified
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            region_restricted, region_alternative, url, is_free, notified, image_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        promo_data['store'], promo_data['app_id'], promo_data['title'],
+        promo_data['store'], 
+        promo_data['app_id'], 
+        promo_data['title'],
         promo_data.get('description', ''),
         promo_data.get('discount_percent', 0),
         promo_data.get('old_price'),
@@ -78,7 +97,8 @@ def save_promotion(promo_data):
         promo_data.get('region_alternative', ''),
         promo_data['url'],
         promo_data.get('is_free', 0),
-        0
+        0,  # notified
+        promo_data.get('image_url', '')  # image_url
     ))
     promo_id = cur.lastrowid
     conn.commit()
@@ -128,11 +148,43 @@ def reject_draft(draft_id):
     conn.close()
 
 def mark_published(draft_id, promo_id):
+    """Отмечает черновик и акцию как опубликованные"""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE drafts SET sent_to_channel = 1 WHERE id = ?', (draft_id,))
+    cur.execute('UPDATE drafts SET sent_to_channel = 1, status = "published" WHERE id = ?', (draft_id,))
     cur.execute('UPDATE promotions SET published = 1 WHERE id = ?', (promo_id,))
     conn.commit()
     conn.close()
 
+def get_promo_image(promo_id):
+    """Получает URL картинки для акции"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT image_url FROM promotions WHERE id = ?', (promo_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row['image_url'] if row else None
+
+def get_pending_drafts():
+    """Получает все черновики со статусом pending, которые ещё не отправлены"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT d.* FROM drafts d
+        WHERE d.status = 'pending' AND d.sent_to_channel = 0
+    ''')
+    drafts = cur.fetchall()
+    conn.close()
+    return drafts
+
+def get_scheduled_count():
+    """Получает количество запланированных черновиков"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM drafts WHERE status = 'scheduled'")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+# Инициализация базы данных
 init_db()

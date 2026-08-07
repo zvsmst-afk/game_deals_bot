@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import config
 import database
 import logging
-import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,10 @@ class SteamParser:
             "https://store.steampowered.com/api/appdetails",
             "https://api.steampowered.com/api/appdetails",
         ]
+
+    def _get_game_image(self, app_id):
+        """Возвращает URL картинки игры (капсулы)"""
+        return f"https://cdn.steamstatic.com/steam/apps/{app_id}/header.jpg"
 
     async def check_promotions(self):
         logger.info("Проверка Steam...")
@@ -29,40 +33,142 @@ class SteamParser:
                 promo = await self._get_promo_for_app(app_id)
                 if promo:
                     promo_id = database.save_promotion(promo)
-                    if promo_id and not promo.get('notified', False):
-                        text = self._generate_post_text(promo)
-                        database.save_draft(promo_id, text)
+                    if promo_id:
+                        conn = database.get_db_connection()
+                        cur = conn.cursor()
+                        cur.execute('''
+                            SELECT id FROM drafts 
+                            WHERE promotion_id = ? AND status = 'pending'
+                        ''', (promo_id,))
+                        existing = cur.fetchone()
+                        conn.close()
+                        
+                        if not existing:
+                            text = self._generate_post_text(promo)
+                            database.save_draft(promo_id, text)
+                            logger.info(f"✅ Новый черновик: {promo['title']}")
+                        else:
+                            logger.info(f"⏩ Черновик для {promo['title']} уже существует, пропускаю")
             except Exception as e:
                 logger.error(f"Ошибка при обработке app_id {app_id}: {e}")
             await asyncio.sleep(0.5)
         logger.info("Проверка Steam завершена")
 
     async def _get_promo_for_app(self, app_id):
-        """Получает данные об акции для одной игры"""
-        # Сначала пробуем Россию
         data_ru = await self._fetch_app_details(app_id, config.PRIMARY_REGION)
-        if data_ru and data_ru.get('success'):
-            game_data = data_ru.get('data', {})
-            price = game_data.get('price_overview', {})
-            logger.info(f"✅ РОССИЯ: {game_data.get('name', '')} | Цена: {price.get('final')} {price.get('currency')} | Скидка: {price.get('discount_percent')}%")
-            promo = self._analyze_data(app_id, data_ru, config.PRIMARY_REGION)
-            if promo:
-                return promo
+        if not data_ru or not data_ru.get('success'):
+            return None
         
-        # Если в РФ нет, пробуем Казахстан
-        data_kz = await self._fetch_app_details(app_id, config.FALLBACK_REGION)
-        if data_kz and data_kz.get('success'):
-            game_data = data_kz.get('data', {})
-            price = game_data.get('price_overview', {})
-            logger.info(f"✅ КАЗАХСТАН: {game_data.get('name', '')} | Цена: {price.get('final')} {price.get('currency')} | Скидка: {price.get('discount_percent')}%")
-            promo = self._analyze_data(app_id, data_kz, config.FALLBACK_REGION)
-            if promo:
-                return promo
+        game_data = data_ru.get('data', {})
+        price_overview = game_data.get('price_overview')
+        if not price_overview:
+            return None
+
+        discount = price_overview.get('discount_percent', 0)
+        if discount == 0 and price_overview.get('final', 0) != 0:
+            return None
+
+        is_free = (price_overview.get('final', 0) == 0)
+        title = game_data.get('name', 'Без названия')
         
-        return None
+        page_data = self._parse_steam_page(app_id)
+        
+        if page_data:
+            old_price = page_data.get('old_price')
+            new_price = page_data.get('new_price')
+            currency = page_data.get('currency', 'RUB')
+        else:
+            old_price = price_overview.get('initial')
+            new_price = price_overview.get('final')
+            currency = price_overview.get('currency', 'RUB')
+
+        region_restricted = False
+        region_alt = ''
+
+        end_date = (datetime.now() + timedelta(days=7)).isoformat()
+        start_date = datetime.now().isoformat()
+        url = f"https://store.steampowered.com/app/{app_id}/"
+
+        promo = {
+            'store': 'steam',
+            'app_id': str(app_id),
+            'title': title,
+            'description': game_data.get('short_description', ''),
+            'discount_percent': discount,
+            'old_price': old_price,
+            'new_price': new_price,
+            'currency': currency,
+            'start_date': start_date,
+            'end_date': end_date,
+            'region_restricted': region_restricted,
+            'region_alternative': region_alt,
+            'url': url,
+            'is_free': is_free,
+            'image_url': self._get_game_image(app_id)
+        }
+        return promo
+
+    def _parse_steam_page(self, app_id):
+        url = f"https://store.steampowered.com/app/{app_id}/?l=russian"
+        try:
+            proxies = None
+            if hasattr(config, 'PROXY') and config.PROXY:
+                proxies = {'http': config.PROXY, 'https': config.PROXY}
+            
+            response = requests.get(url, timeout=10, proxies=proxies)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            old_price_element = soup.find('div', {'class': 'discount_original_price'})
+            if old_price_element:
+                old_price_text = old_price_element.text.strip()
+            else:
+                old_price_text = None
+            
+            new_price_element = soup.find('div', {'class': 'discount_final_price'})
+            if not new_price_element:
+                new_price_element = soup.find('div', {'class': 'game_purchase_price'})
+            
+            if new_price_element:
+                new_price_text = new_price_element.text.strip()
+            else:
+                new_price_text = None
+            
+            if not new_price_text:
+                return None
+            
+            numbers_old = re.findall(r'[\d\s]+', old_price_text) if old_price_text else []
+            numbers_new = re.findall(r'[\d\s]+', new_price_text) if new_price_text else []
+            
+            old_price = None
+            new_price = None
+            
+            if numbers_old:
+                old_price = int(''.join(numbers_old[0].split()))
+            if numbers_new:
+                new_price = int(''.join(numbers_new[0].split()))
+            
+            if old_price is None and new_price is not None:
+                old_price = new_price
+            
+            if new_price is None:
+                return None
+            
+            currency = 'RUB'
+            if old_price_text and ('₸' in old_price_text or 'тенге' in old_price_text):
+                currency = 'KZT'
+            elif new_price_text and ('₸' in new_price_text or 'тенге' in new_price_text):
+                currency = 'KZT'
+            
+            return {
+                'old_price': old_price,
+                'new_price': new_price,
+                'currency': currency
+            }
+        except Exception as e:
+            logger.debug(f"Ошибка парсинга страницы для {app_id}: {e}")
+            return None
 
     def _get_discounted_apps(self):
-        """Получает список игр со скидками"""
         url = "https://store.steampowered.com/search/?specials=1&category1=998"
         try:
             proxies = None
@@ -87,7 +193,6 @@ class SteamParser:
             return []
 
     async def _fetch_app_details(self, app_id, cc):
-        """Запрашивает данные игры через Steam API"""
         params = {'appids': app_id, 'cc': cc, 'l': 'russian'}
         
         if hasattr(config, 'STEAM_API_KEY') and config.STEAM_API_KEY:
@@ -112,87 +217,7 @@ class SteamParser:
                 continue
         return None
 
-    def _get_russian_description(self, app_id):
-        """Парсит страницу игры и возвращает русское описание"""
-        url = f"https://store.steampowered.com/app/{app_id}/?l=russian"
-        try:
-            proxies = None
-            if hasattr(config, 'PROXY') and config.PROXY:
-                proxies = {'http': config.PROXY, 'https': config.PROXY}
-            
-            response = requests.get(url, timeout=10, proxies=proxies)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            desc_elem = soup.find('div', {'class': 'game_description_snippet'})
-            if desc_elem:
-                return desc_elem.text.strip()
-            
-            desc_elem = soup.find('div', {'class': 'game_area_description'})
-            if desc_elem:
-                return desc_elem.text.strip()
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Ошибка парсинга страницы для {app_id}: {e}")
-            return None
-
-    def _analyze_data(self, app_id, data, region):
-        """Анализирует данные игры и определяет акцию"""
-        game_data = data.get('data')
-        if not game_data:
-            return None
-
-        price_overview = game_data.get('price_overview')
-        if not price_overview:
-            return None
-
-        discount = price_overview.get('discount_percent', 0)
-        if discount == 0 and price_overview.get('final', 0) != 0:
-            return None
-
-        is_free = (price_overview.get('final', 0) == 0)
-
-        title = game_data.get('name', 'Без названия')
-        description = self._get_russian_description(app_id)
-        if not description:
-            description = game_data.get('short_description', '')
-        
-        old_price = price_overview.get('initial')
-        new_price = price_overview.get('final')
-        currency = price_overview.get('currency', 'RUB')
-
-        # 🔥 БЕЗ КОНВЕРТАЦИИ — просто определяем доступность
-        if region == config.PRIMARY_REGION:
-            region_restricted = False
-            region_alt = ''
-        else:
-            region_restricted = True
-            region_alt = config.FALLBACK_REGION.upper()
-
-        end_date = (datetime.now() + timedelta(days=7)).isoformat()
-        start_date = datetime.now().isoformat()
-        url = f"https://store.steampowered.com/app/{app_id}/"
-
-        promo = {
-            'store': 'steam',
-            'app_id': str(app_id),
-            'title': title,
-            'description': description,
-            'discount_percent': discount,
-            'old_price': old_price,
-            'new_price': new_price,
-            'currency': currency,
-            'start_date': start_date,
-            'end_date': end_date,
-            'region_restricted': region_restricted,
-            'region_alternative': region_alt,
-            'url': url,
-            'is_free': is_free
-        }
-        return promo
-
     def _generate_post_text(self, promo):
-        """Генерирует текст поста"""
         currency_symbols = {
             'RUB': '₽',
             'KZT': '₸',
@@ -202,24 +227,30 @@ class SteamParser:
         symbol = currency_symbols.get(promo['currency'], promo['currency'])
 
         if promo['is_free']:
-            text = f"🎁 Раздача: {promo['title']}\n"
+            text = f"🎁 <b>РАЗДАЧА</b>\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━━\n"
+            text += f"🎮 <b>{promo['title']}</b>\n\n"
         else:
-            text = f"🎮 {promo['title']}\n"
+            text = f"🔥 <b>СКИДКА</b>\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━━\n"
+            text += f"🎮 <b>{promo['title']}</b>\n\n"
 
-        if promo['description']:
-            text += f"📝 {promo['description'][:200]}...\n"
+        if promo.get('description'):
+            text += f"📝 {promo['description'][:250]}...\n\n"
 
         if promo['is_free']:
-            text += "🆓 Бесплатно\n"
+            text += f"💰 <b>Цена:</b> 🆓 БЕСПЛАТНО\n\n"
         else:
-            text += f"💰 Скидка: {promo['discount_percent']}% (было {promo['old_price']}{symbol} → {promo['new_price']}{symbol})\n"
+            text += f"💸 <b>Скидка:</b> {promo['discount_percent']}%\n"
+            text += f"   🏷️ Было: <s>{promo['old_price']}{symbol}</s>\n"
+            text += f"   ✅ Стало: <b>{promo['new_price']}{symbol}</b>\n\n"
 
-        text += f"📅 Действует до {promo['end_date'][:10]}\n"
+        text += f"📅 <b>Действует до:</b> {promo['end_date'][:10]}\n\n"
 
         if promo['region_restricted']:
-            text += f"🌍 Цена в тенге (₸), можно забрать с {promo['region_alternative']}-аккаунта\n"
+            text += f"🌍 Цена в тенге (₸), можно забрать с {promo['region_alternative']}-аккаунта\n\n"
         else:
-            text += "🌍 Доступна в РФ\n"
+            text += f"🌍 <b>Доступна в РФ</b>\n\n"
 
-        text += f"🔗 [Ссылка в Steam]({promo['url']})"
+        # Ссылка в тексте убрана — она будет только в кнопке
         return text
